@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "restep"
+version = "0.1.0"
+description = "Cliente genérico para APIs Restep 1, guiado por el documento de descubrimiento."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+async = ["httpx>=0.24"]
+
+[project.urls]
+Homepage = "https://restep.wubytes.com/"
+
+[tool.setuptools]
+packages = ["restep"]
+
+[tool.setuptools.package-data]
+restep = ["py.typed"]
