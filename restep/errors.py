@@ -18,10 +18,10 @@ __all__ = [
     "RestepError", "ClientError", "ServerError",
     "BadRequest", "InvalidParameter", "UnsupportedParameter", "IdempotencyKeyRequired",
     "Unauthenticated", "Forbidden", "NotFound", "MethodNotAllowed", "NotAcceptable", "Conflict",
-    "Gone", "StateExpired", "Retired", "PreconditionFailed", "ContentTooLarge", "UriTooLong",
+    "RequestInProgress", "Gone", "StateExpired", "Retired", "PreconditionFailed", "ContentTooLarge", "UriTooLong",
     "UnsupportedMediaType", "Invalid", "IdempotencyMismatch", "NotExecuted", "PreconditionRequired",
     "RateLimited", "Internal", "ServerNotImplemented", "Unavailable",
-    "RestepDeprecationWarning", "error_from_problem",
+    "RestepDeprecationWarning", "UnsupportedVersion", "ExperimentalNotUsable", "error_from_problem",
 ]
 
 
@@ -100,7 +100,7 @@ class Unauthenticated(ClientError):
 
     @property
     def resource_metadata(self) -> str | None:
-        """La URL de los metadatos de recurso protegido del reto, si la trae (§10.5, RFC 9728)."""
+        """La URL de los metadatos de recurso protegido del reto, si la trae (§11.5, RFC 9728)."""
         m = re.search(r'resource_metadata="([^"]*)"', self.www_authenticate or "")
         return m.group(1) if m else None
 
@@ -126,7 +126,14 @@ class NotAcceptable(ClientError):
 
 
 class Conflict(ClientError):
+    """Choca con el estado actual: un duplicado, una transición imposible. Repetirla no sirve."""
     code = "conflict"
+
+
+class RequestInProgress(ClientError):
+    """La misma petición con la misma ``Idempotency-Key`` sigue en curso (§7.1): se puede volver a
+    enviar con la misma clave, después de ``retry_after`` si llegó. No es un ``Conflict``."""
+    code = "request_in_progress"
 
 
 class Gone(ClientError):
@@ -196,10 +203,27 @@ class RestepDeprecationWarning(DeprecationWarning):
     """La respuesta llevaba ``Deprecation`` (§5.5): lo que se ha usado se va a retirar."""
 
 
+class UnsupportedVersion(ValueError):
+    """El documento de descubrimiento declara en ``restep`` algo que no es una versión de Restep 1:
+    no sigue la gramática de §1.1 o su versión mayor no es 1. Un cliente de Restep 1 no lo trata
+    como descubrimiento ni supone por eso solo ``core`` (§1.1): esa API no es Restep 1."""
+
+    def __init__(self, version: Any, url: str | None = None) -> None:
+        self.version = version
+        self.url = url
+        where = f" en {url}" if url else ""
+        super().__init__(f"El descubrimiento{where} declara restep={version!r}, que no es una versión de Restep 1 (§1.1).")
+
+
+class ExperimentalNotUsable(LookupError):
+    """Una parte experimental (§1.2) que el servidor no anuncia, o que anuncia bajo una versión cuyo
+    texto este cliente no implementa: no se usa (§1.2)."""
+
+
 _BY_CODE: dict[str, type[RestepError]] = {
     cls.code: cls for cls in (
         BadRequest, InvalidParameter, UnsupportedParameter, IdempotencyKeyRequired, Unauthenticated, Forbidden,
-        NotFound, MethodNotAllowed, NotAcceptable, Conflict, StateExpired, Retired, PreconditionFailed,
+        NotFound, MethodNotAllowed, NotAcceptable, Conflict, RequestInProgress, StateExpired, Retired, PreconditionFailed,
         ContentTooLarge, UriTooLong, UnsupportedMediaType, Invalid, IdempotencyMismatch, NotExecuted,
         PreconditionRequired, RateLimited, Internal, ServerNotImplemented, Unavailable)
     if cls.code
@@ -217,7 +241,7 @@ _BY_STATUS: dict[int, type[RestepError]] = {
 _STATUS_OF: dict[str, int] = {
     "bad_request": 400, "invalid_parameter": 400, "unsupported_parameter": 400, "idempotency_key_required": 400,
     "unauthenticated": 401, "forbidden": 403, "not_found": 404, "method_not_allowed": 405, "not_acceptable": 406,
-    "conflict": 409, "state_expired": 410, "retired": 410, "precondition_failed": 412, "content_too_large": 413,
+    "conflict": 409, "request_in_progress": 409, "state_expired": 410, "retired": 410, "precondition_failed": 412, "content_too_large": 413,
     "uri_too_long": 414, "unsupported_media_type": 415, "invalid": 422, "idempotency_mismatch": 422,
     "not_executed": 424, "precondition_required": 428, "rate_limited": 429, "internal": 500,
     "not_implemented": 501, "unavailable": 503,
@@ -241,7 +265,7 @@ def local_error(cls: type[RestepError], detail: str, *, parameter: str | None = 
                 status: int = 400, **extra: Any) -> RestepError:
     """Un error detectado en el cliente, con la misma forma que el que daría el servidor."""
     code = cls.code or "bad_request"
-    problem: dict[str, Any] = {"type": f"https://restep.wubytes.com/1/errors#{code}", "title": detail,
+    problem: dict[str, Any] = {"type": f"https://w3id.org/restep/1/errors#{code}", "title": detail,
                                "status": status, "code": code, "detail": detail, **extra}
     if parameter is not None:
         problem["parameter"] = parameter

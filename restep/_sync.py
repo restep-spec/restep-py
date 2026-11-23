@@ -8,7 +8,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from . import errors as E
 from ._core import (AUTO, ApiCore, CollectionCore, Filter, IdempotencyKey, Item, PageData, Request, Response,
-                    Total, is_discovery, merge_headers, with_etag)
+                    SingletonCore, Total, is_discovery, merge_headers, with_etag)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -27,6 +27,7 @@ class Api:
                              retries=retries, max_retry_wait=max_retry_wait, timeout=timeout)
         self._opener = urllib.request.build_opener(_NoRedirect())
         self._collections: dict[str, Collection] = {}
+        self._singletons: dict[str, Singleton] = {}
 
     # Transporte
     def _send_once(self, req: Request) -> Response:
@@ -55,17 +56,21 @@ class Api:
     def _discover(self) -> None:
         req = self._core.build("GET", self._core.root)
         resp, doc = self._call(req)
+        where = self._core.root
         if not is_discovery(doc):
-            # §4.2: si la raíz está ocupada, el documento puede estar enlazado con service-desc.
+            # §4.2: si la raíz está ocupada, el documento puede estar enlazado con service-desc; vale el
+            # primer destino que sea un documento de descubrimiento.
             for target in self._core.service_desc(resp):
                 try:
                     _, doc = self._call(self._core.build("GET", target))
-                except E.RestepError:
+                except (E.RestepError, ValueError):
                     continue
                 if is_discovery(doc):
+                    where = target
                     break
-        self._core.set_discovery(doc)
+        self._core.set_discovery(doc, where)
         self._collections = {n: Collection(self, n, d) for n, d in self._core.declarations.items()}
+        self._singletons = {n: Singleton(self, n, d) for n, d in self._core.singleton_declarations.items()}
 
     # Lo que dice el descubrimiento
     @property
@@ -86,8 +91,34 @@ class Api:
         return self._core.extensions
 
     @property
+    def version(self) -> str | None:
+        """El ``restep`` que declara el servidor (§1.1), o ``None`` sin descubrimiento."""
+        return self._core.restep_version
+
+    @property
+    def pre_release(self) -> str | None:
+        """``"draft.6"``, ``"rc.1"``… si declara un borrador o un candidato, del que no hay que
+        suponer las garantías de una versión publicada (§1.1); ``None`` si es una publicada."""
+        return self._core.pre_release
+
+    def usable(self, part: str) -> bool:
+        """Si se puede usar un perfil o una extensión: anunciado y, si es experimental, bajo una
+        versión cuyo texto implementa este cliente (§1.2)."""
+        return self._core.usable(part)
+
+    @property
+    def deprecations(self) -> list[dict[str, Any]]:
+        """Los avisos de retirada del descubrimiento (§5.5), con ``announced``, ``sunset`` y ``where``."""
+        return self._core.deprecations()
+
+    @property
     def collections(self) -> Mapping[str, "Collection"]:
         return dict(self._collections)
+
+    @property
+    def singletons(self) -> Mapping[str, "Singleton"]:
+        """Los singletons declarados (§5.9), sin los de plantilla o con ``parent``, que se ignoran."""
+        return dict(self._singletons)
 
     def __getitem__(self, name: str) -> "Collection":
         try:
@@ -111,10 +142,11 @@ class Api:
         target = (self.discovery or {}).get("status")
         if not isinstance(target, str):
             raise LookupError("El descubrimiento no declara status (§4.4); no hay que suponer una ruta.")
-        resp = self._send(self._core.build("GET", self._core.url(target)))
+        req = self._core.build("GET", self._core.url(target))
+        resp = self._send(req)
         if resp.status in (200, 503):
             return resp.status == 200
-        self._core.parse(Request("GET", self._core.url(target), {}), resp)
+        self._core.parse(req, resp)
         return False
 
     def __repr__(self) -> str:
@@ -161,26 +193,26 @@ class Collection(CollectionCore):
         _, body = self._client._call(self._api.build("GET", self._api.url(url)))
         return Page(self, PageData.from_body(body))
 
-    def list(self, *, filter: Filter | None = None, sort: str | Sequence[str] | None = None,
+    def list(self, *, filter: Filter | None = None, named: Mapping[str, Any] | None = None, sort: str | Sequence[str] | None = None,
              fields: str | Sequence[str] | None = None, include: str | Sequence[str] | None = None,
              limit: int | None = None, count: bool = False) -> Page:
         """Una página de la colección (§5.2, §6)."""
-        _, body = self._client._call(self.list_request(filter=filter, sort=sort, fields=fields, include=include,
+        _, body = self._client._call(self.list_request(filter=filter, named=named, sort=sort, fields=fields, include=include,
                                                        limit=limit, count=count))
         return Page(self, PageData.from_body(body))
 
-    def iter(self, *, filter: Filter | None = None, sort: str | Sequence[str] | None = None,
+    def iter(self, *, filter: Filter | None = None, named: Mapping[str, Any] | None = None, sort: str | Sequence[str] | None = None,
              fields: str | Sequence[str] | None = None, include: str | Sequence[str] | None = None,
              limit: int | None = None) -> Iterator[Item]:
         """Todos los elementos, página a página; ``limit`` es el tamaño de cada página."""
-        page: Page | None = self.list(filter=filter, sort=sort, fields=fields, include=include, limit=limit)
+        page: Page | None = self.list(filter=filter, named=named, sort=sort, fields=fields, include=include, limit=limit)
         while page is not None:
             yield from page.items
             page = page.next_page()
 
-    def count(self, *, filter: Filter | None = None) -> Total:
+    def count(self, *, filter: Filter | None = None, named: Mapping[str, Any] | None = None) -> Total:
         """Cuántos elementos hay (§6.5). ``Total.estimated`` dice si el número es aproximado."""
-        page = self.list(filter=filter, limit=1, count=True)
+        page = self.list(filter=filter, named=named, limit=1, count=True)
         if page.total is None:
             raise E.RestepError(200, {"detail": "Se pidió count=true y la respuesta no trae total (§6.5)."}, local=True)
         return page.total
@@ -207,7 +239,7 @@ class Collection(CollectionCore):
         self._client._call(self.delete_request(id, if_match))
 
     def action(self, id: Any, name: str, data: Any = None, *, idempotency_key: IdempotencyKey = AUTO) -> Any:
-        """Ejecuta una acción declarada (§10.1): de elemento con su id, de colección con ``None``.
+        """Ejecuta una acción declarada (§11.1): de elemento con su id, de colección con ``None``.
         Devuelve el cuerpo de la respuesta, o ``None`` si no lo hay (204)."""
         _, body = self._client._call(self.action_request(id, name, data, idempotency_key))
         return body
@@ -216,10 +248,32 @@ class Collection(CollectionCore):
         return f"<restep.Collection {self.name} {self.path_template}>"
 
 
+class Singleton(SingletonCore):
+    """Un singleton del descubrimiento (§5.9): ``api.singletons["shop"].get()``."""
+
+    def __init__(self, api: Api, name: str, decl: Mapping[str, Any]) -> None:
+        super().__init__(api._core, name, decl)
+        self._client = api
+
+    def get(self, *, fields: str | Sequence[str] | None = None) -> Item:
+        """Su representación; sin ``fields``, con su ETag en ``_etag`` (§7.2)."""
+        resp, body = self._client._call(self.get_request(fields))
+        return body if fields else with_etag(resp, body)
+
+    def update(self, patch: Mapping[str, Any], *, if_match: str | Mapping[str, Any] | None = None) -> Item:
+        """Lo actualiza con JSON Merge Patch (§5.9, §5.1); ``if_match`` como en las colecciones."""
+        resp, body = self._client._call(self.update_request(patch, if_match))
+        return with_etag(resp, body if isinstance(body, dict) else {})
+
+    def __repr__(self) -> str:
+        return f"<restep.Singleton {self.name} {self.path}>"
+
+
 def connect(url: str, token: str | None = None, language: str | None = None, *,
             headers: Mapping[str, str] | None = None, validate: bool = True, retries: int = 0,
             max_retry_wait: float = 60.0, timeout: float = 30.0) -> Api:
-    """Conecta con una API Restep leyendo su documento de descubrimiento (§4.2).
+    """Conecta con una API Restep leyendo su documento de descubrimiento (§4.2). Si declara una
+    versión que no es de Restep 1 (§1.1), da ``restep.UnsupportedVersion``.
 
     - ``token``: se envía como ``Authorization: Bearer`` solo al origen de la API (§4.3).
     - ``language``: ``Accept-Language`` para los textos de la API (errores, descripciones, §5.6).

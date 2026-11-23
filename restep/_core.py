@@ -15,7 +15,7 @@ from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 from . import errors as E
 
-SPEC = "https://restep.wubytes.com/1/"
+PROFILE = "https://w3id.org/restep/1/"  # identificador: enlace de perfil y tipos de error
 Item = dict[str, Any]
 JSON_TYPES = "application/json"
 
@@ -92,8 +92,30 @@ _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _DATETIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})")
 _DURATION = re.compile(r"-?P(?=[0-9T])([0-9]+Y)?([0-9]+M)?([0-9]+W)?([0-9]+D)?(T(?=[0-9])([0-9]+H)?([0-9]+M)?([0-9]+(\.[0-9]+)?S)?)?")
 _ID = re.compile(r"[A-Za-z0-9._~-]+")
-_ACTION = re.compile(r"[a-z][a-z0-9_]*")
+_ACTION = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")  # la gramática de los nombres (§3)
 OPS = ("eq", "ne", "lt", "le", "gt", "ge", "in", "null")
+FIELD_TYPES = frozenset({"string", "integer", "number", "decimal", "boolean", "date", "datetime", "duration", "enum"})
+
+# ── Versiones (§1.1) y partes experimentales (§1.2) ──────────────────────────
+_RESTEP_VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-((?:draft|rc)\.(?:0|[1-9][0-9]*)))?")
+# Las versiones cuyo texto implementa este cliente: el borrador 6 y la 1.0 que salga de él. Con
+# otra versión, las partes experimentales no se usan (§1.2).
+IMPLEMENTED_VERSIONS = frozenset({"1.0-draft.6"})  # §1.2: el texto de la 1.0 aún no existe
+EXPERIMENTAL = frozenset({"sync", "batch", "filter-expr", "query-method", "inherit"})
+# Dónde puede ir cada kind de aviso de retirada (§5.5); uno desconocido no se usa (§4.2).
+DEPRECATION_KINDS = {
+    "root": frozenset({"version", "profile", "extension", "collection", "singleton", "reason"}),
+    "collection": frozenset({"field", "filter", "operator", "value", "sort", "relation", "include", "count",
+                             "max_limit", "action", "method", "item_method"}),
+    "singleton": frozenset({"field", "method"}),
+}
+
+
+def parse_version(value: Any) -> tuple[int, int, str | None] | None:
+    """``(mayor, menor, prelanzamiento)`` de un valor de ``restep`` que sigue la gramática de §1.1
+    (``"1.0"``, ``"1.0-draft.6"``, ``"1.0-rc.1"``), o ``None`` si no la sigue."""
+    m = _RESTEP_VERSION.fullmatch(value) if isinstance(value, str) else None
+    return (int(m.group(1)), int(m.group(2)), m.group(3)) if m else None
 
 
 def iso_duration(td: _dt.timedelta) -> str:
@@ -121,6 +143,9 @@ def _decimal_text(d: Decimal) -> str:
 def format_filter_value(value: Any, decl: Mapping[str, Any], parameter: str) -> str:
     """El texto de un operando de filtro, comprobado contra el tipo declarado (§6.1)."""
     kind = decl.get("type", "string")
+    if kind not in FIELD_TYPES:
+        # §4.2: un type desconocido no se usa; quien llama ya ha tratado el filtro como no declarado.
+        raise E.local_error(E.UnsupportedParameter, f"{parameter}: tipo desconocido {kind!r} (§4.2).", parameter=parameter)
 
     def bad(why: str) -> E.RestepError:
         return E.local_error(E.InvalidParameter, f"{parameter}: {why}", parameter=parameter)
@@ -246,6 +271,14 @@ def etag_value(if_match: Any) -> str:
     return f'"{if_match}"'
 
 
+def _problem_code(resp: Response) -> str | None:
+    try:
+        code = json.loads(resp.body.decode("utf-8")).get("code")
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        return None
+    return code if isinstance(code, str) else None
+
+
 class ApiCore:
     """Estado común de una conexión: raíz, credenciales, idioma, descubrimiento y opciones."""
 
@@ -253,7 +286,7 @@ class ApiCore:
                  headers: Mapping[str, str] | None = None, validate: bool = True, retries: int = 0,
                  max_retry_wait: float = 60.0, timeout: float = 30.0) -> None:
         if not url.endswith("/"):
-            url += "/"  # la raíz de la API conserva su barra final (§10.5), y así urljoin no pierde el último segmento
+            url += "/"  # la raíz de la API conserva su barra final (§11.5), y así urljoin no pierde el último segmento
         parts = urlsplit(url)
         if parts.scheme not in ("http", "https") or not parts.netloc:
             raise ValueError(f"La URL de la API tiene que ser http o https absoluta: {url}")
@@ -267,6 +300,7 @@ class ApiCore:
         self.max_retry_wait = max_retry_wait
         self.timeout = timeout
         self.discovery: dict[str, Any] | None = None
+        self.version: tuple[int, int, str | None] | None = None
 
     # Descubrimiento (§4.2)
     @property
@@ -285,8 +319,73 @@ class ApiCore:
         cols = d.get("collections") if d else None
         return cols if isinstance(cols, dict) else {}
 
-    def set_discovery(self, doc: Any) -> None:
-        self.discovery = doc if is_discovery(doc) else None
+    @property
+    def singleton_declarations(self) -> dict[str, dict[str, Any]]:
+        """Los singletons del descubrimiento (§5.9), sin los que tienen una plantilla en ``path`` o
+        llevan ``parent``, que un cliente DEBE ignorar (formas reservadas a versiones menores)."""
+        d = self.discovery
+        found = d.get("singletons") if d else None
+        if not isinstance(found, dict):
+            return {}
+        return {n: s for n, s in found.items() if isinstance(s, dict) and isinstance(s.get("path"), str)
+                and "{" not in s["path"] and "parent" not in s}
+
+    def set_discovery(self, doc: Any, url: str | None = None) -> None:
+        if not is_discovery(doc):
+            self.discovery, self.version = None, None
+            return
+        version = parse_version(doc["restep"])
+        if version is None or version[0] != 1:
+            # §1.1: ni descubrimiento de Restep 1 ni «solo core»: esa API no se puede usar como Restep 1.
+            raise E.UnsupportedVersion(doc["restep"], url)
+        self.discovery, self.version = doc, version
+
+    @property
+    def restep_version(self) -> str | None:
+        return self.discovery["restep"] if self.discovery else None
+
+    @property
+    def pre_release(self) -> str | None:
+        """``"draft.6"`` o ``"rc.1"`` si el servidor declara un borrador o un candidato: entonces no
+        hay que suponerle las garantías de ninguna versión publicada ni de otro borrador (§1.1)."""
+        return self.version[2] if self.version else None
+
+    def usable(self, part: str) -> bool:
+        """Si se puede usar un perfil o una extensión: anunciado y, si es experimental (§1.2),
+        bajo una versión declarada cuyo texto implementa este cliente (para un borrador, ese mismo)."""
+        if part not in self.profiles and part not in self.extensions:
+            return False
+        return part not in EXPERIMENTAL or self.restep_version in IMPLEMENTED_VERSIONS
+
+    @property
+    def has_credentials(self) -> bool:
+        return bool(self.token) or any(k.lower() in ("authorization", "cookie") for k in self.extra_headers)
+
+    @property
+    def anonymous_keys(self) -> bool:
+        """§7.1: ``"anonymous": false`` en ``idempotency`` dice que el servidor rechaza
+        ``Idempotency-Key`` en peticiones sin credenciales. Falta, o cualquier otro valor, es ``true``."""
+        idem = (self.discovery or {}).get("idempotency")
+        return not (isinstance(idem, dict) and idem.get("anonymous") is False)
+
+    def deprecations(self) -> list[dict[str, Any]]:
+        """Los avisos de retirada del descubrimiento (§5.5), con ``where`` (``""`` para la raíz, el
+        nombre de la colección o ``singleton:nombre``). Los de un ``kind`` desconocido en su sitio no
+        se usan (§4.2) y no salen."""
+        out: list[dict[str, Any]] = []
+
+        def take(notices: Any, place: str, where: str) -> None:
+            for n in notices if isinstance(notices, list) else []:
+                if isinstance(n, dict) and n.get("kind") in DEPRECATION_KINDS[place]:
+                    out.append({**n, "where": where})
+        d = self.discovery or {}
+        take(d.get("deprecations"), "root", "")
+        for name, c in self.declarations.items():
+            if isinstance(c, dict):
+                take(c.get("deprecations"), "collection", name)
+        for name, sg in self.singleton_declarations.items():
+            take(sg.get("deprecations"), "singleton", f"singleton:{name}")
+        return out
 
     def service_desc(self, resp: Response) -> list[str]:
         """Destinos ``service-desc`` de la respuesta de la raíz, los de tipo JSON primero (§4.2)."""
@@ -312,13 +411,19 @@ class ApiCore:
               retry_safe: bool | None = None) -> Request:
         if query:
             url += ("&" if "?" in url else "?") + urlencode(list(query), quote_via=quote, safe=",")
+        # §3: no se sigue un enlace con un esquema que no sea https ni el de la raíz (file:, data:…).
+        scheme = urlsplit(url).scheme.lower()
+        if scheme not in ("https", urlsplit(self.root).scheme.lower()):
+            raise ValueError(f"No se sigue un enlace con el esquema {scheme or '(ninguno)'}: solo https o el de la raíz (§3).")
         h = {"accept": "application/json, application/problem+json"}
         if self.language:
             h["accept-language"] = self.language
-        h.update({k.lower(): v for k, v in self.extra_headers.items()})
-        # §4.3: las credenciales de la API solo van a su origen.
-        if self.token and self.same_origin(url):
-            h["authorization"] = f"Bearer {self.token}"
+        # §4.3: las credenciales de la API (el token y las cabeceras propias, que pueden llevarlas)
+        # solo van a su origen.
+        if self.same_origin(url):
+            h.update({k.lower(): v for k, v in self.extra_headers.items()})
+            if self.token:
+                h["authorization"] = f"Bearer {self.token}"
         data = None
         if has_body or body is not None:
             data = dump_json(body)
@@ -330,8 +435,11 @@ class ApiCore:
 
     def retry_delay(self, req: Request, resp: Response, attempt: int) -> float | None:
         """Cuánto esperar antes de repetir, o ``None`` si no se repite. Un 429 no se atendió y
-        siempre se puede repetir; un 503, solo si repetir no puede duplicar el efecto."""
-        if attempt >= self.retries or resp.status not in (429, 503):
+        siempre se puede repetir; un 409 ``request_in_progress``, también (es la misma petición
+        con la misma clave, §7.1); un 503, solo si repetir no puede duplicar el efecto."""
+        if attempt >= self.retries or resp.status not in (409, 429, 503):
+            return None
+        if resp.status == 409 and _problem_code(resp) != "request_in_progress":
             return None
         if resp.status == 503 and not req.retry_safe:
             return None
@@ -384,6 +492,62 @@ class CollectionCore:
     def variables(self) -> list[str]:
         return _VAR.findall(self.path_template)
 
+    @property
+    def parent(self) -> str | None:
+        """La colección de la que cuelgan los elementos de esta subcolección (§4.2)."""
+        p = self.declaration.get("parent")
+        return p if isinstance(p, str) else None
+
+    @property
+    def id_from(self) -> str:
+        """Quién elige el ``id`` (§5.1): ``"server"``, ``"client"``, ``"either"`` o el valor
+        desconocido tal cual (con el que no se manda ``id``)."""
+        v = self.declaration.get("id_from", "server")
+        return v if isinstance(v, str) else repr(v)
+
+    def collation(self, field: str) -> str:
+        """Cómo compara y ordena el servidor un campo de cadena (§6.1): ``"codepoint"`` si no está
+        en ``collations``; ``"server"`` si lo dice, o si el valor no es una cadena o no se conoce.
+        Con ``"server"`` no hay que reproducir ese orden ni esa igualdad en local."""
+        c = self.declaration.get("collations")
+        if not isinstance(c, dict) or field not in c:
+            return "codepoint"
+        return "codepoint" if c[field] == "codepoint" else "server"
+
+    def ref(self, id: Any) -> dict[str, str]:
+        """El objeto de relación para enlazar un elemento de esta colección (§3, §5.1). En una
+        subcolección lleva ``href``, que es obligatorio para enlazarla: su ``id`` solo identifica al
+        elemento bajo su padre."""
+        out = {"id": str(id)}
+        if self.variables:
+            out["href"] = urlsplit(self._item_url(id)).path
+        return out
+
+    def inherited(self, item: Mapping[str, Any], field: str) -> Any:
+        """De dónde sale el valor de un campo efectivo (§11.6): ``"own"`` (su valor propio),
+        ``{"href": ...}`` (la fuente real), ``"default"``, ``"hidden"`` o ``None`` si el elemento no
+        trae ``_inherited`` y no se sabe. Un ``from`` desconocido es ``"hidden"``. ``inherit`` es
+        experimental: solo se usa bajo una versión cuyo texto implementa este cliente (§1.2)."""
+        if not self._api.usable("inherit"):
+            raise E.ExperimentalNotUsable(
+                f"inherit no se usa: el servidor no lo anuncia o declara restep={self._api.restep_version!r}, "
+                f"y este cliente implementa {', '.join(sorted(IMPLEMENTED_VERSIONS))} (§1.2).")
+        decl = self.declaration.get("inherit")
+        if not isinstance(decl, dict) or field not in decl:
+            raise KeyError(f"{self.name} no declara «{field}» en inherit (§11.6).")
+        info = item.get("_inherited")
+        if not isinstance(info, Mapping):
+            return None
+        if field not in info:
+            return "own"
+        entry = info[field]
+        frm = entry.get("from") if isinstance(entry, Mapping) else None
+        if frm in ("default", "hidden"):
+            return frm
+        if isinstance(frm, Mapping) and isinstance(frm.get("href"), str):
+            return {"href": frm["href"]}
+        return "hidden"
+
     def _path(self) -> str:
         def fill(m: re.Match[str]) -> str:
             v = m.group(1)
@@ -425,14 +589,16 @@ class CollectionCore:
         if not self._has("query"):
             raise self._unsupported(parameter, f"el servidor no anuncia el perfil query, así que no admite {parameter} (§5.3).")
 
-    # Parámetros de lectura (§6, §8)
-    def read_query(self, *, filter: Filter | None = None, sort: str | Sequence[str] | None = None,
+    # Parámetros de lectura (§6, §9)
+    def read_query(self, *, filter: Filter | None = None, named: Mapping[str, Any] | None = None, sort: str | Sequence[str] | None = None,
                    fields: str | Sequence[str] | None = None, include: str | Sequence[str] | None = None,
                    limit: int | None = None, count: bool = False, item: bool = False) -> list[tuple[str, str]]:
         q: list[tuple[str, str]] = []
         check = self._api.validate
         if filter:
             q += self._filter(filter) if check else self._filter_raw(filter)
+        if named:
+            q += self._named(named, check)
         if sort is not None:
             keys = _split(sort)
             if check:
@@ -465,9 +631,42 @@ class CollectionCore:
         if count:
             if check:
                 self._need_query("count")
-                if not self.declaration.get("count"):
+                if self.declaration.get("count") not in ("exact", "estimated"):
+                    # Sin declarar, o con un valor desconocido, que no se usa (§4.2).
                     raise self._unsupported("count", "la colección no declara count (§6.5).")
             q.append(("count", "true"))
+        return q
+
+    def _named(self, named: Mapping[str, Any], check: bool) -> list[tuple[str, str]]:
+        """§6.1: filtros con nombre, sin operadores. ``{"featured": True}`` (un interruptor, sin valor)
+        o ``{"search": "niebla"}`` (un valor de su tipo). ``None`` no lo aplica, y ``False`` tampoco en un interruptor."""
+        q: list[tuple[str, str]] = []
+        declared: Mapping[str, Any] = self.declaration.get("named_filters") or {}
+        for name, value in named.items():
+            if value is None:
+                continue
+            parameter = f"filter[{name}]"
+            if not check:
+                if value is not False:
+                    q.append((parameter, "" if value is True else _plain(value)))
+                continue
+            self._need_query(parameter)
+            decl = declared.get(name)
+            if isinstance(decl, Mapping) and "type" in decl and decl["type"] not in FIELD_TYPES:
+                decl = None  # §4.2: un type desconocido es como si no estuviera declarado
+            if not isinstance(decl, Mapping):
+                offered = ", ".join(declared) or "ninguno"
+                raise self._unsupported(parameter, f"«{name}» no es un filtro con nombre; filtros con nombre: {offered} (§6.1).")
+            if not decl.get("type"):
+                if value is False:
+                    continue
+                if value is not True:
+                    raise self._invalid(parameter, f"«{name}» es un interruptor: pasa True, sin valor (§6.1).")
+                q.append((parameter, ""))
+                continue
+            if value == "" or (isinstance(value, bool) and decl["type"] != "boolean"):
+                raise self._invalid(parameter, f"«{name}» necesita un valor {decl['type']} (§6.1).")
+            q.append((parameter, format_filter_value(value, decl, parameter)))
         return q
 
     def _filter_raw(self, filter: Filter) -> list[tuple[str, str]]:
@@ -499,9 +698,11 @@ class CollectionCore:
             for op, value, parameter in conds:
                 self._need_query(parameter)
                 decl = declared.get(name)
+                if isinstance(decl, Mapping) and decl.get("type") not in FIELD_TYPES:
+                    decl = None  # §4.2: un filtro con un type desconocido se trata como no declarado
                 if not isinstance(decl, Mapping):
-                    offered = ", ".join(declared) or "ninguno"
-                    raise self._unsupported(parameter, f"no se puede filtrar por «{name}»; campos de filtro: {offered} (§6.1).")
+                    offered = ", ".join(n for n, d in declared.items() if isinstance(d, Mapping) and d.get("type") in FIELD_TYPES) or "ninguno"
+                    raise self._unsupported(parameter, f"no se puede filtrar por «{name}»; campos de filtro: {offered} (§6.1, §4.2).")
                 ops = decl.get("ops") or []
                 if op not in ops:
                     raise self._unsupported(parameter, f"el filtro «{name}» no admite el operador {op}; admite {', '.join(ops)} (§6.1).")
@@ -534,17 +735,17 @@ class CollectionCore:
         if not paths:
             raise self._invalid("include", "include no puede ir vacío.")
         if not self._has("relations"):
-            raise self._unsupported("include", "el servidor no anuncia el perfil relations (§8).")
+            raise self._unsupported("include", "el servidor no anuncia el perfil relations (§9).")
         depth = self.declaration.get("include_depth") or 1
         for path in paths:
             parts = path.split(".")
             if len(parts) > depth:
-                raise self._unsupported("include", f"«{path}» pasa de include_depth ({depth}) (§8).")
+                raise self._unsupported("include", f"«{path}» pasa de include_depth ({depth}) (§9).")
             decl: Mapping[str, Any] | None = self.declaration
             for i, rel in enumerate(parts):
                 r, target = self._relation_target(decl or {}, rel)
                 if r is None or not r.get("include"):
-                    raise self._unsupported("include", f"«{rel}» no es una relación que se pueda incluir (§8).")
+                    raise self._unsupported("include", f"«{rel}» no es una relación que se pueda incluir (§9).")
                 if i < len(parts) - 1 and target is None:
                     raise self._unsupported("include", f"no sé seguir «{path}» más allá de «{rel}».")
                 decl = target
@@ -565,7 +766,7 @@ class CollectionCore:
                     raise self._invalid("fields", f"«{f}» entra en un mapa de idioma; pide «{head}» entero (§6.3).")
                 if head in rels:
                     if f.rsplit(".", 1)[0] not in included:
-                        raise self._invalid("fields", f"«{f}» es de una relación que no está en include (§8).")
+                        raise self._invalid("fields", f"«{f}» es de una relación que no está en include (§9).")
                     continue
                 raise self._invalid("fields", f"«{f}» no es un campo de {self.name} (§6.3).")
             if isinstance(props, Mapping) and f != "id" and f not in props and f not in maps:
@@ -582,20 +783,37 @@ class CollectionCore:
         return self._api.build("GET", url, query=self.read_query(fields=fields, include=include, item=True))
 
     def _key_header(self, key: IdempotencyKey, applies: bool) -> dict[str, str]:
+        # §7.1: con "anonymous": false, una petición sin credenciales no lleva clave: la automática no
+        # se pone, y una explícita daría 400 (salvo en una acción idempotente, que la ignora).
+        anonymous_refused = not self._api.anonymous_keys and not self._api.has_credentials
         if key is AUTO:
-            key = str(uuid.uuid4()) if applies and self._has("writes") else None
+            key = str(uuid.uuid4()) if applies and self._has("writes") and not anonymous_refused else None
+        if isinstance(key, str) and anonymous_refused:
+            if not applies:
+                return {}
+            if self._api.validate:
+                raise E.local_error(E.BadRequest, "El servidor no admite Idempotency-Key sin credenciales "
+                                    '("anonymous": false, §7.1): pasa idempotency_key=None o un token.',
+                                    errors=[{"header": "Idempotency-Key", "code": "unknown"}])
         return {"idempotency-key": sf_string(key)} if isinstance(key, str) else {}
 
     def create_request(self, data: Any, idempotency_key: IdempotencyKey) -> Request:
         self._check_method("POST", False)
+        id_from = self.id_from
         if self._api.validate:
             if not isinstance(data, Mapping):
                 raise TypeError("create() espera un objeto (dict) con el elemento.")
-            if "id" in data:
-                raise E.local_error(E.Invalid, "El servidor asigna el id: no lo envíes en create() (§5.1).", status=422,
-                                    errors=[{"pointer": "/id", "code": "read_only"}])
+            if "id" in data and id_from not in ("client", "either"):
+                why = ("El servidor asigna el id: no lo envíes en create() (§5.1)." if id_from == "server" else
+                       f"id_from tiene un valor desconocido ({id_from}): no se envía id (§5.1).")
+                raise E.local_error(E.Invalid, why, status=422, errors=[{"pointer": "/id", "code": "read_only"}])
+            if "id" not in data and id_from == "client":
+                raise E.local_error(E.Invalid, f"{self.name} pide que el cliente elija el id (id_from: client, §5.1).",
+                                    status=422, errors=[{"pointer": "/id", "code": "required"}])
         h = self._key_header(idempotency_key, True)
-        return self._api.build("POST", self._url(), body=data, has_body=True, headers=h, retry_safe=bool(h))
+        # §5.7: un POST con un id elegido por el cliente no puede crear dos elementos.
+        client_id = isinstance(data, Mapping) and "id" in data and id_from in ("client", "either")
+        return self._api.build("POST", self._url(), body=data, has_body=True, headers=h, retry_safe=bool(h) or client_id)
 
     def update_request(self, id: Any, patch: Any, if_match: Any) -> Request:
         self._check_method("PATCH", True)
@@ -612,14 +830,17 @@ class CollectionCore:
 
     def action_request(self, id: Any, name: str, data: Any, idempotency_key: IdempotencyKey) -> Request:
         if not _ACTION.fullmatch(name):
-            raise ValueError(f"«{name}» no es un nombre de acción (snake_case, §10.1).")
+            raise ValueError(f"«{name}» no es un nombre de acción (§3, §11.1).")
         decl = (self.declaration.get("actions") or {}).get(name)
+        # §4.2: una acción con un on o un method desconocidos se trata como no declarada, y no se usa.
+        if isinstance(decl, Mapping) and (decl.get("on") not in ("item", "collection") or decl.get("method", "POST") not in ("GET", "POST")):
+            raise E.local_error(E.NotFound, f"{self.name}:{name} se declara con un on o un method desconocidos; no se usa (§4.2).", status=404)
         if self._api.validate:
             if "actions" not in self._api.extensions:
-                raise E.local_error(E.NotFound, "El servidor no anuncia la extensión actions (§10.1).", status=404)
+                raise E.local_error(E.NotFound, "El servidor no anuncia la extensión actions (§11.1).", status=404)
             if not isinstance(decl, Mapping):
                 offered = ", ".join(self.declaration.get("actions") or {}) or "ninguna"
-                raise E.local_error(E.NotFound, f"{self.name} no declara la acción «{name}»; declara: {offered} (§10.1).", status=404)
+                raise E.local_error(E.NotFound, f"{self.name} no declara la acción «{name}»; declara: {offered} (§11.1).", status=404)
             on = decl.get("on")
             if on == "item" and id is None:
                 raise TypeError(f"La acción «{name}» es de elemento: pasa su id.")
@@ -628,13 +849,59 @@ class CollectionCore:
         decl = decl if isinstance(decl, Mapping) else {}
         method = "GET" if decl.get("method") == "GET" else "POST"
         if method == "GET" and data is not None:
-            raise TypeError(f"La acción «{name}» usa GET y no lleva cuerpo (§10.1).")
+            raise TypeError(f"La acción «{name}» usa GET y no lleva cuerpo (§11.1).")
         url = (self._item_url(id) if id is not None else self._url()) + ":" + name
         if method == "GET":
             return self._api.build("GET", url)
         idempotent = decl.get("idempotent") is True
         h = self._key_header(idempotency_key, not idempotent)
         return self._api.build("POST", url, body=data, headers=h, retry_safe=idempotent or bool(h))
+
+
+class SingletonCore:
+    """Un singleton (§5.9): un recurso sin colección ni ``id``, como ``/me``. Admite ``GET`` y, si lo
+    declara, ``PATCH`` con merge patch; con ``query``, ``fields``. Nada más: ni ``POST`` ni ``DELETE``
+    (dan ``405``) ni ``include`` ni otros parámetros reservados."""
+
+    def __init__(self, api: ApiCore, name: str, decl: Mapping[str, Any]) -> None:
+        self._api = api
+        self.name = name
+        self.declaration: dict[str, Any] = dict(decl)
+
+    @property
+    def path(self) -> str:
+        return str(self.declaration["path"])
+
+    def _url(self) -> str:
+        return self._api.api_path(self.path)
+
+    def _check_method(self, method: str) -> None:
+        declared = self.declaration.get("methods")
+        if self._api.validate and isinstance(declared, list) and method not in declared:
+            raise E.local_error(E.MethodNotAllowed, f"El singleton {self.name} no admite {method}; admite {', '.join(declared)} (§5.9).",
+                                status=405)
+
+    def get_request(self, fields: Any = None) -> Request:
+        self._check_method("GET")
+        q: list[tuple[str, str]] = []
+        if fields is not None:
+            fl = _split(fields)
+            if self._api.validate:
+                if "query" not in self._api.profiles:
+                    raise E.local_error(E.UnsupportedParameter, f"{self.name}: el servidor no anuncia query, así que no admite fields (§5.3).",
+                                        parameter="fields")
+                if not fl:
+                    raise E.local_error(E.InvalidParameter, f"{self.name}: fields no puede ir vacío.", parameter="fields")
+            q.append(("fields", ",".join(fl)))
+        return self._api.build("GET", self._url(), query=q)
+
+    def update_request(self, patch: Any, if_match: Any) -> Request:
+        self._check_method("PATCH")
+        if self._api.validate and not isinstance(patch, Mapping):
+            raise TypeError("update() espera un objeto (dict) con el merge patch (RFC 7396).")
+        h = {"if-match": etag_value(if_match)} if if_match is not None else {}
+        return self._api.build("PATCH", self._url(), body=patch, has_body=True,
+                               content_type="application/merge-patch+json", headers=h)
 
 
 def with_etag(resp: Response, data: Any) -> Any:

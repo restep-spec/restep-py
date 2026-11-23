@@ -11,7 +11,7 @@ from typing import Any, AsyncIterator, Iterator, Mapping, Sequence
 
 from . import errors as E
 from ._core import (AUTO, ApiCore, CollectionCore, Filter, IdempotencyKey, Item, PageData, Request, Response,
-                    Total, is_discovery, merge_headers, with_etag)
+                    SingletonCore, Total, is_discovery, merge_headers, with_etag)
 
 try:  # import condicional: httpx no es una dependencia
     import httpx as _httpx
@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover
 
 HAS_HTTPX = _httpx is not None
 
-__all__ = ["connect", "AsyncApi", "AsyncCollection", "AsyncPage", "HAS_HTTPX"]
+__all__ = ["connect", "AsyncApi", "AsyncCollection", "AsyncSingleton", "AsyncPage", "HAS_HTTPX"]
 
 
 def _header_pairs(headers: Any) -> list[tuple[str, str]]:
@@ -41,6 +41,7 @@ class AsyncApi:
             client = _httpx.AsyncClient(timeout=timeout, follow_redirects=False)
         self._client = client
         self._collections: dict[str, AsyncCollection] = {}
+        self._singletons: dict[str, AsyncSingleton] = {}
 
     async def aclose(self) -> None:
         if self._own_client:
@@ -72,16 +73,19 @@ class AsyncApi:
 
     async def _discover(self) -> None:
         resp, doc = await self._call(self._core.build("GET", self._core.root))
+        where = self._core.root
         if not is_discovery(doc):
             for target in self._core.service_desc(resp):
                 try:
                     _, doc = await self._call(self._core.build("GET", target))
-                except E.RestepError:
+                except (E.RestepError, ValueError):
                     continue
                 if is_discovery(doc):
+                    where = target
                     break
-        self._core.set_discovery(doc)
+        self._core.set_discovery(doc, where)
         self._collections = {n: AsyncCollection(self, n, d) for n, d in self._core.declarations.items()}
+        self._singletons = {n: AsyncSingleton(self, n, d) for n, d in self._core.singleton_declarations.items()}
 
     @property
     def root(self) -> str:
@@ -100,8 +104,27 @@ class AsyncApi:
         return self._core.extensions
 
     @property
+    def version(self) -> str | None:
+        return self._core.restep_version
+
+    @property
+    def pre_release(self) -> str | None:
+        return self._core.pre_release
+
+    def usable(self, part: str) -> bool:
+        return self._core.usable(part)
+
+    @property
+    def deprecations(self) -> list[dict[str, Any]]:
+        return self._core.deprecations()
+
+    @property
     def collections(self) -> Mapping[str, "AsyncCollection"]:
         return dict(self._collections)
+
+    @property
+    def singletons(self) -> Mapping[str, "AsyncSingleton"]:
+        return dict(self._singletons)
 
     def __getitem__(self, name: str) -> "AsyncCollection":
         try:
@@ -160,24 +183,24 @@ class AsyncCollection(CollectionCore):
         _, body = await self._client._call(self._api.build("GET", self._api.url(url)))
         return AsyncPage(self, PageData.from_body(body))
 
-    async def list(self, *, filter: Filter | None = None, sort: str | Sequence[str] | None = None,
+    async def list(self, *, filter: Filter | None = None, named: Mapping[str, Any] | None = None, sort: str | Sequence[str] | None = None,
                    fields: str | Sequence[str] | None = None, include: str | Sequence[str] | None = None,
                    limit: int | None = None, count: bool = False) -> AsyncPage:
-        _, body = await self._client._call(self.list_request(filter=filter, sort=sort, fields=fields, include=include,
+        _, body = await self._client._call(self.list_request(filter=filter, named=named, sort=sort, fields=fields, include=include,
                                                              limit=limit, count=count))
         return AsyncPage(self, PageData.from_body(body))
 
-    async def iter(self, *, filter: Filter | None = None, sort: str | Sequence[str] | None = None,
+    async def iter(self, *, filter: Filter | None = None, named: Mapping[str, Any] | None = None, sort: str | Sequence[str] | None = None,
                    fields: str | Sequence[str] | None = None, include: str | Sequence[str] | None = None,
                    limit: int | None = None) -> AsyncIterator[Item]:
-        page: AsyncPage | None = await self.list(filter=filter, sort=sort, fields=fields, include=include, limit=limit)
+        page: AsyncPage | None = await self.list(filter=filter, named=named, sort=sort, fields=fields, include=include, limit=limit)
         while page is not None:
             for item in page.items:
                 yield item
             page = await page.next_page()
 
-    async def count(self, *, filter: Filter | None = None) -> Total:
-        page = await self.list(filter=filter, limit=1, count=True)
+    async def count(self, *, filter: Filter | None = None, named: Mapping[str, Any] | None = None) -> Total:
+        page = await self.list(filter=filter, named=named, limit=1, count=True)
         if page.total is None:
             raise E.RestepError(200, {"detail": "Se pidió count=true y la respuesta no trae total (§6.5)."}, local=True)
         return page.total
@@ -201,6 +224,20 @@ class AsyncCollection(CollectionCore):
     async def action(self, id: Any, name: str, data: Any = None, *, idempotency_key: IdempotencyKey = AUTO) -> Any:
         _, body = await self._client._call(self.action_request(id, name, data, idempotency_key))
         return body
+
+
+class AsyncSingleton(SingletonCore):
+    def __init__(self, api: AsyncApi, name: str, decl: Mapping[str, Any]) -> None:
+        super().__init__(api._core, name, decl)
+        self._client = api
+
+    async def get(self, *, fields: str | Sequence[str] | None = None) -> Item:
+        resp, body = await self._client._call(self.get_request(fields))
+        return body if fields else with_etag(resp, body)
+
+    async def update(self, patch: Mapping[str, Any], *, if_match: str | Mapping[str, Any] | None = None) -> Item:
+        resp, body = await self._client._call(self.update_request(patch, if_match))
+        return with_etag(resp, body if isinstance(body, dict) else {})
 
 
 async def connect(url: str, token: str | None = None, language: str | None = None, *,
