@@ -3,8 +3,8 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "restep"
-version = "0.2.0"
+name = "restep-py"
+version = "0.2.1"
 description = "Cliente genérico para APIs Restep 1, guiado por el documento de descubrimiento."
 readme = "README.md"
 license = { text = "MIT" }

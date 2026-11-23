@@ -19,7 +19,7 @@ from ._sync import Api, Collection, Page, Singleton, connect
 from .errors import *  # noqa: F401,F403
 from .errors import RestepError, __all__ as _errors
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = ["connect", "Api", "Collection", "Singleton", "Page", "AUTO", "Item", "Total", "IMPLEMENTED_VERSIONS", "parse_version", "oauth_metadata_url",
            "oauth_metadata", "__version__", *_errors]

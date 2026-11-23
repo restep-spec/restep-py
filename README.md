@@ -5,6 +5,11 @@ por el documento de descubrimiento (§4.2). Python 3.10 o posterior, solo biblio
 (urllib). La versión asíncrona usa [httpx](https://www.python-httpx.org/) si está instalado;
 no es una dependencia.
 
+```bash
+pip install restep-py            # se importa como `restep`
+pip install "restep-py[async]"   # con httpx
+```
+
 No genera código: lee el descubrimiento al conectar y con él sabe qué colecciones hay, qué
 métodos admiten, por qué campos se filtra y ordena, con qué operadores y de qué tipo. Lo que el
 descubrimiento dice que el servidor rechazaría se rechaza antes de enviarlo, con la misma
@@ -201,7 +206,7 @@ async with await restep.aio.connect(url, language="es") as api:
 ```
 
 La misma API, con `await` y `async for`. Necesita httpx (`pip install httpx`, o el extra
-`restep[async]`); sin él, `restep.aio.connect` da `ImportError` salvo que le pases `client=`,
+`restep-py[async]`); sin él, `restep.aio.connect` da `ImportError` salvo que le pases `client=`,
 cualquier objeto con la forma de `httpx.AsyncClient` (`async request(method, url, headers=,
 content=)` que devuelve algo con `status_code`, `headers` y `content`).
 
