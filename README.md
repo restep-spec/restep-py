@@ -1,21 +1,20 @@
 # restep (Python)
 
-Cliente genérico para APIs [Restep 1](https://restep.wubytes.com/es/1/) (borrador 6), guiado
-por el documento de descubrimiento (§4.2). Python 3.10 o posterior, solo biblioteca estándar
-(urllib). La versión asíncrona usa [httpx](https://www.python-httpx.org/) si está instalado;
-no es una dependencia.
+Generic client for [Restep 1](https://restep.wubytes.com/1/) APIs (draft 6), driven by the
+discovery document (§4.2). Python 3.10 or later, standard library only (urllib). The async
+version uses [httpx](https://www.python-httpx.org/) if it is installed; it is not a dependency.
 
 ```bash
-pip install restep-py            # se importa como `restep`
-pip install "restep-py[async]"   # con httpx
+pip install restep-py            # imported as `restep`
+pip install "restep-py[async]"   # with httpx
 ```
 
-No genera código: lee el descubrimiento al conectar y con él sabe qué colecciones hay, qué
-métodos admiten, por qué campos se filtra y ordena, con qué operadores y de qué tipo. Lo que el
-descubrimiento dice que el servidor rechazaría se rechaza antes de enviarlo, con la misma
-excepción que daría el servidor.
+It does not generate code: it reads the discovery document on connect, and from it knows which
+collections exist, which methods they accept, which fields can be filtered and sorted, with which
+operators and of which type. Whatever the discovery document says the server would reject is
+rejected before it is sent, with the same exception the server would give.
 
-## Uso
+## Usage
 
 ```python
 import restep
@@ -23,160 +22,164 @@ import restep
 api = restep.connect("http://localhost:8080/", token=None, language="es")
 api.profiles            # frozenset({'core', 'query', 'writes', 'cache'})
 api.version             # '1.0-draft.6'
-api.pre_release         # 'draft.6': un borrador, sin las garantías de una versión publicada (§1.1)
+api.pre_release         # 'draft.6': a draft, without the guarantees of a published version (§1.1)
 api.collections         # {'books': <restep.Collection books /books>, ...}
 api.singletons          # {'shop': <restep.Singleton shop /shop>} (§5.9)
-api.deprecations        # avisos de retirada, con announced y sunset (§5.5)
+api.deprecations        # deprecation notices, with announced and sunset (§5.5)
 
 books = api["books"]
 page = books.list(filter={"price": {"le": "20"}, "category": ["novela-negra", "poesia"]},
                   sort="-rating", fields=["title", "price"], limit=10, count=True)
 page.items, page.total, page.total.estimated
-page = page.next_page()            # None en la última; sigue next tal cual (§5.2)
+page = page.next_page()            # None on the last one; follows next as is (§5.2)
 
-for book in books.iter(filter={"year": {"ge": 2023}}, limit=50):   # todas las páginas
+for book in books.iter(filter={"year": {"ge": 2023}}, limit=50):   # every page
     ...
 books.count(filter={"rating": {"null": True}})                      # Total(3, estimated=False)
-books.list(named={"featured": True, "search": "niebla"})           # filtros con nombre (§6.1), sin operadores
+books.list(named={"featured": True, "search": "niebla"})           # named filters (§6.1), no operators
 
-book = books.get("7")              # lleva su ETag de elemento en book["_etag"] (§7.2)
+book = books.get("7")              # carries its item ETag in book["_etag"] (§7.2)
 new = books.create({"title": "...", "price": "9.90", "category": "poesia"})
-new = books.update(new["id"], {"price": "10.50"}, if_match=new)     # If-Match con su _etag
+new = books.update(new["id"], {"price": "10.50"}, if_match=new)     # If-Match with its _etag
 books.delete(new["id"], if_match=new)
 
 api["orders"].action("2001", "cancel")                 # POST /orders/2001:cancel (§11.1)
-api["orders"].action(None, "import", {"rows": [...]})  # acción de colección
-api["reviews"].at(book_id="7").list()                  # subcolección /books/{book_id}/reviews
+api["orders"].action(None, "import", {"rows": [...]})  # collection action
+api["reviews"].at(book_id="7").list()                  # subcollection /books/{book_id}/reviews
 api["reviews"].at(book_id="7").ref("3")                # {"id": "3", "href": "/books/7/reviews/3"} (§5.1)
-api["categories"].create({"id": "papeleria", ...})     # id elegido por el cliente (id_from, §5.1)
-api["categories"].collation("name")                    # "server" o "codepoint" (§6.1)
+api["categories"].create({"id": "papeleria", ...})     # client-chosen id (id_from, §5.1)
+api["categories"].collation("name")                    # "server" or "codepoint" (§6.1)
 api["products"].inherited(item, "tax_rate")            # "own", {"href": …}, "default", "hidden" (§11.6)
-shop = api.singletons["shop"].get()                    # singleton (§5.9), con _etag
+shop = api.singletons["shop"].get()                    # singleton (§5.9), with _etag
 api.singletons["shop"].update({"phone": "…"}, if_match=shop)
-api.status()                                           # True/False según el status declarado (§4.4)
+api.status()                                           # True/False from the declared status (§4.4)
 ```
 
 ### `restep.connect(url, token=None, language=None, *, ...)`
 
-| Opción | Qué hace |
+| Option | What it does |
 |---|---|
-| `token` | `Authorization: Bearer`, solo hacia el origen de la API (§4.3) |
-| `language` | `Accept-Language` para los textos de la API: errores y descripciones (§5.6) |
-| `headers` | Cabeceras adicionales en cada petición |
-| `validate=True` | Comprueba parámetros, métodos y acciones contra el descubrimiento antes de enviar |
-| `retries=0` | Reintentos ante `429`, `503` y `409 request_in_progress` (abajo) |
-| `max_retry_wait=60` | Si `Retry-After` pide esperar más, no se reintenta |
-| `timeout=30` | Segundos por petición |
+| `token` | `Authorization: Bearer`, only to the API's origin (§4.3) |
+| `language` | `Accept-Language` for the API's texts: errors and descriptions (§5.6) |
+| `headers` | Extra headers on every request |
+| `validate=True` | Checks parameters, methods and actions against the discovery document before sending |
+| `retries=0` | Retries on `429`, `503` and `409 request_in_progress` (below) |
+| `max_retry_wait=60` | If `Retry-After` asks to wait longer, it does not retry |
+| `timeout=30` | Seconds per request |
 
-Si la raíz no es un documento de descubrimiento, busca en sus enlaces `rel="service-desc"`,
-primero los de tipo JSON (§4.2). Si no encuentra ninguno, supone solo `core`: `api.discovery`
-es `None` y `api.collection("things")` (o `api.collection("x", path="/ruta")`) da una colección
-sin declaraciones.
+If the root is not a discovery document, it looks through its `rel="service-desc"` links, JSON
+ones first (§4.2). If it finds none, it assumes `core` only: `api.discovery` is `None` and
+`api.collection("things")` (or `api.collection("x", path="/path")`) gives a collection with no
+declarations.
 
-Si el documento declara en `restep` algo que no sigue la gramática de §1.1 o una versión mayor
-que no es 1 (`"2.0"`, `"1.00"`), `connect` da `restep.UnsupportedVersion`: esa API no es Restep 1,
-y tampoco se supone solo `core` (§1.1). `restep.parse_version("1.0-draft.6")` da `(1, 0, "draft.6")`.
+If the document declares in `restep` something that does not follow the grammar of §1.1, or a
+major version other than 1 (`"2.0"`, `"1.00"`), `connect` raises `restep.UnsupportedVersion`: that
+API is not Restep 1, and `core` only is not assumed either (§1.1).
+`restep.parse_version("1.0-draft.6")` gives `(1, 0, "draft.6")`.
 
-### Filtros
+### Filters
 
-`filter` es un diccionario campo → condición (§6.1):
+`filter` is a dictionary of field → condition (§6.1):
 
-| Python | Petición |
+| Python | Request |
 |---|---|
 | `{"category": "poesia"}` | `filter[category]=poesia` |
 | `{"price": {"le": "20", "ge": 10}}` | `filter[price][le]=20&filter[price][ge]=10` |
-| `{"id": ["7", "12"]}` o `{"id": {"in": ["7", "12"]}}` | `filter[id][in]=7,12` |
+| `{"id": ["7", "12"]}` or `{"id": {"in": ["7", "12"]}}` | `filter[id][in]=7,12` |
 | `{"rating": {"null": True}}` | `filter[rating][null]=true` |
 | `{"name.es-mx": "Separador"}` | `filter[name.es-mx]=Separador` |
 
-Los valores se convierten según el tipo declarado: `Decimal`, `int` y `float` para `decimal`,
-`number` e `integer`; `date`, `datetime` con zona horaria y `timedelta` para `date`,
-`datetime` y `duration`; `bool` solo para `boolean`. Una cadena también vale si tiene la forma
-del tipo. Un `None` es un error (para «sin valor», `{"null": True}`).
+Values are converted according to the declared type: `Decimal`, `int` and `float` for `decimal`,
+`number` and `integer`; `date`, time-zone-aware `datetime` and `timedelta` for `date`,
+`datetime` and `duration`; `bool` only for `boolean`. A string also works if it has the shape of
+the type. `None` is an error (for "no value", use `{"null": True}`).
 
-`sort`, `fields` e `include` aceptan una cadena con comas o una lista.
+`sort`, `fields` and `include` accept a comma-separated string or a list.
 
-### Validación local
+### Local validation
 
-Con `validate=True` (por defecto), antes de enviar:
+With `validate=True` (the default), before sending:
 
-- `UnsupportedParameter`: un perfil que el servidor no anuncia (`query`, `relations`), un campo
-  u operador de filtro, un campo de orden o una relación no declarados, una ruta de `include`
-  más honda que `include_depth`, `count` en una colección que no lo declara (§5.3).
-- `InvalidParameter`: un valor que no encaja con el tipo, un `enum` fuera de `values`, una
-  lista `in` vacía o con comas, un `limit` fuera de `1..max_limit`, un campo de `fields` que no
-  está en el esquema `item` (si viene incrustado), una ruta que entra en un mapa de idioma
-  (`name.es`), una ruta de relación que no está en `include`.
-- `MethodNotAllowed` (405): un método que `methods` o `item_methods` no declaran (§4.3).
-- `NotFound` (404): una acción que la colección no declara, o sin la extensión `actions`.
-- `Invalid` (422): un `create` que trae `id` donde lo asigna el servidor (sin `id_from` o con
-  `"server"`) o donde `id_from` tiene un valor desconocido; o que no lo trae con `"client"` (§5.1).
-- `BadRequest` (400): una `idempotency_key` explícita sin credenciales cuando el servidor declara
+- `UnsupportedParameter`: a profile the server does not announce (`query`, `relations`); an
+  undeclared filter field or operator, sort field or relation; an `include` path deeper than
+  `include_depth`; `count` on a collection that does not declare it (§5.3).
+- `InvalidParameter`: a value that does not fit the type, an `enum` outside `values`, an empty
+  `in` list or one with commas, a `limit` outside `1..max_limit`, a `fields` field that is not in
+  the `item` schema (if embedded), a path that goes into a language map (`name.es`), a relation
+  path that is not in `include`.
+- `MethodNotAllowed` (405): a method that `methods` or `item_methods` do not declare (§4.3).
+- `NotFound` (404): an action the collection does not declare, or without the `actions`
+  extension.
+- `Invalid` (422): a `create` that carries `id` where the server assigns it (no `id_from`, or
+  `"server"`) or where `id_from` has an unknown value; or one that lacks it with `"client"` (§5.1).
+- `BadRequest` (400): an explicit `idempotency_key` without credentials when the server declares
   `"anonymous": false` (§7.1).
-- Lo que el descubrimiento declara con un valor que el cliente no conoce se trata como no
-  declarado (§4.2): un filtro o un filtro con nombre con un `type` desconocido
-  (`UnsupportedParameter`), un `count` desconocido, una acción con `on` o `method` desconocidos
-  (`NotFound`, también con `validate=False`) y un aviso de retirada con un `kind` desconocido (no
-  sale en `api.deprecations`).
-- `ValueError`/`TypeError`: un id que no es de Restep (§3), una variable de ruta que falta, una
-  acción de elemento sin id.
+- Anything the discovery document declares with a value the client does not know is treated as
+  undeclared (§4.2): a filter or named filter with an unknown `type` (`UnsupportedParameter`), an
+  unknown `count`, an action with an unknown `on` or `method` (`NotFound`, also with
+  `validate=False`), and a deprecation notice with an unknown `kind` (left out of
+  `api.deprecations`).
+- `ValueError`/`TypeError`: an id that is not a Restep id (§3), a missing path variable, an item
+  action without an id.
 
-Estos errores llevan `local = True`, y `problem`, `parameter` y `detail` como los del servidor,
-así que el mismo `except` sirve para los dos. Con `validate=False` todo va al servidor.
+These errors carry `local = True`, plus `problem`, `parameter` and `detail` like the server's, so
+the same `except` handles both. With `validate=False` everything goes to the server.
 
-### Errores
+### Errors
 
-Cada respuesta `4xx` o `5xx` se convierte en una excepción a partir de su problem+json (§5.4):
+Every `4xx` or `5xx` response becomes an exception built from its problem+json (§5.4):
 
 ```python
 try:
     books.list(filter={"nope": 1})
-except restep.UnsupportedParameter as e:   # no reintentes: la API no ofrece eso
+except restep.UnsupportedParameter as e:   # don't retry: the API does not offer that
     e.status, e.code, e.parameter, e.detail, e.errors, e.reason, e.problem, e.headers
-except restep.InvalidParameter as e:       # corrige el valor y reintenta
+except restep.InvalidParameter as e:       # fix the value and retry
     ...
 ```
 
-Jerarquía: `RestepError` → `ClientError` (4xx) y `ServerError` (5xx). Una clase por `code` de
-la tabla de §5.4: `BadRequest` (y sus hijas `InvalidParameter`, `UnsupportedParameter`,
-`IdempotencyKeyRequired`), `Unauthenticated` (con `resource_metadata` del reto),
-`Forbidden`, `NotFound`, `MethodNotAllowed` (con `allow`), `NotAcceptable`, `Conflict`,
-`RequestInProgress` (el otro `409`: la misma petición con la misma `Idempotency-Key` sigue en
-curso, §7.1; no es hija de `Conflict`, porque se puede repetir), `Gone` (`StateExpired`, `Retired`), `PreconditionFailed`, `ContentTooLarge`, `UriTooLong`,
+Hierarchy: `RestepError` → `ClientError` (4xx) and `ServerError` (5xx). One class per `code` in
+the table in §5.4: `BadRequest` (and its children `InvalidParameter`, `UnsupportedParameter`,
+`IdempotencyKeyRequired`), `Unauthenticated` (with `resource_metadata` from the challenge),
+`Forbidden`, `NotFound`, `MethodNotAllowed` (with `allow`), `NotAcceptable`, `Conflict`,
+`RequestInProgress` (the other `409`: the same request with the same `Idempotency-Key` is still in
+progress, §7.1; not a child of `Conflict`, because it can be repeated), `Gone` (`StateExpired`,
+`Retired`), `PreconditionFailed`, `ContentTooLarge`, `UriTooLong`,
 `UnsupportedMediaType`, `Invalid`, `IdempotencyMismatch`, `NotExecuted`,
 `PreconditionRequired`, `RateLimited`, `Internal`, `ServerNotImplemented`, `Unavailable`.
-Un `code` desconocido se trata según su estado (§5.4): la clase del estado si solo hay una, si
-no `ClientError` o `ServerError`. `e.retry_after` da los segundos de `Retry-After`.
+An unknown `code` is handled by its status (§5.4): the status's class if there is only one,
+otherwise `ClientError` or `ServerError`. `e.retry_after` gives the seconds from `Retry-After`.
 
-Una respuesta con `Deprecation` (§5.5) emite un `restep.RestepDeprecationWarning`.
+A response with `Deprecation` (§5.5) emits a `restep.RestepDeprecationWarning`.
 
-### Escrituras
+### Writes
 
-- `create` envía una `Idempotency-Key` nueva (un UUID, como cadena de Structured Fields) si el
-  servidor anuncia `writes` (§7.1). `idempotency_key="..."` usa la tuya; `None`, ninguna. Los
-  reintentos de una misma llamada llevan la misma clave. Si el servidor declara
-  `"idempotency": {"anonymous": false}` y la conexión no lleva credenciales (`token`, o
-  `Authorization` o `Cookie` en `headers`), la clave automática no se pone; una acción
-  idempotente no la lleva nunca.
-- Todo cuerpo va con `Content-Type: application/json`, salvo el de `update`, que es un merge
+- `create` sends a fresh `Idempotency-Key` (a UUID, as a Structured Fields string) if the server
+  announces `writes` (§7.1). `idempotency_key="..."` uses yours; `None`, none at all. Retries of
+  the same call carry the same key. If the server declares
+  `"idempotency": {"anonymous": false}` and the connection has no credentials (`token`, or
+  `Authorization` or `Cookie` in `headers`), the automatic key is not set; an idempotent action
+  never carries one.
+- Every body goes with `Content-Type: application/json`, except `update`'s, which is a merge
   patch (§3).
-- Las acciones declaradas `"idempotent": false` llevan clave igual que `create`; las
-  idempotentes, no. Una acción con `"method": "GET"` va por `GET` y no admite cuerpo.
-- `update` usa `application/merge-patch+json` (§5.1). `if_match` acepta la ETag (con o sin
-  comillas) o el elemento leído, del que toma `_etag`.
-- `get` sin `fields` ni `include`, `create` y `update` copian la cabecera `ETag` en `_etag`
-  cuando es la ETag de elemento (fuerte y sin codificación de contenido, §7.2), así que el
-  elemento devuelto sirve tal cual como `if_match`. Los elementos de un listado traen su propio
-  `_etag` cuando el servidor lo pone (§7.2), y sirven igual sin leerlos antes.
+- Actions declared `"idempotent": false` carry a key just like `create`; idempotent ones do not.
+  An action with `"method": "GET"` goes over `GET` and takes no body.
+- `update` uses `application/merge-patch+json` (§5.1). `if_match` accepts the ETag (with or
+  without quotes) or the item you read, from which it takes `_etag`.
+- `get` without `fields` or `include`, `create` and `update` copy the `ETag` header into `_etag`
+  when it is the item ETag (strong and without content coding, §7.2), so the returned item works
+  as is as `if_match`. Items in a listing carry their own `_etag` when the server sets it (§7.2),
+  and work the same way without reading them first.
 
-### Reintentos
+### Retries
 
-Con `retries=n`, un `429` se repite siempre (no se atendió) y un `503` solo si repetirlo no
-puede duplicar el efecto: `GET`, `PATCH`, `DELETE`, un `POST` con `Idempotency-Key` o con un
-`id` elegido por el cliente (§5.7), o una acción idempotente. Un `409 request_in_progress` también se repite, con la misma `Idempotency-Key`; un
-`409 conflict`, nunca. Espera lo que diga `Retry-After` (segundos o fecha HTTP) o, sin él, 0,5 s,
-1 s, 2 s... Por defecto no reintenta: sin `retries`, un `409 request_in_progress` llega como
-`restep.RequestInProgress`, con `e.retry_after`.
+With `retries=n`, a `429` is always repeated (it was not processed) and a `503` only if repeating
+it cannot duplicate the effect: `GET`, `PATCH`, `DELETE`, a `POST` with an `Idempotency-Key` or
+with a client-chosen `id` (§5.7), or an idempotent action. A `409 request_in_progress` is also
+repeated, with the same `Idempotency-Key`; a `409 conflict`, never. It waits for whatever
+`Retry-After` says (seconds or an HTTP date) or, without it, 0.5 s, 1 s, 2 s... By default it does
+not retry: without `retries`, a `409 request_in_progress` arrives as
+`restep.RequestInProgress`, with `e.retry_after`.
 
 ### OAuth (§11.5)
 
@@ -184,16 +187,16 @@ puede duplicar el efecto: `GET`, `PATCH`, `DELETE`, un `POST` con `Idempotency-K
 try:
     api = restep.connect(url)
 except restep.Unauthenticated as e:
-    e.resource_metadata                     # URL de los metadatos, del reto del 401
-meta = restep.oauth_metadata(url)           # metadatos RFC 9728, comprobando resource
+    e.resource_metadata                     # metadata URL, from the 401 challenge
+meta = restep.oauth_metadata(url)           # RFC 9728 metadata, checking resource
 restep.oauth_metadata_url("https://example.com/api/")
 # 'https://example.com/.well-known/oauth-protected-resource/api/'
 ```
 
-El cliente no obtiene tokens: eso es cosa de la biblioteca OAuth que uses. Con el token,
-`restep.connect(url, token=...)`.
+The client does not obtain tokens: that is the job of whatever OAuth library you use. Once you
+have the token, `restep.connect(url, token=...)`.
 
-### Asíncrono
+### Async
 
 ```python
 import restep.aio
@@ -205,92 +208,95 @@ async with await restep.aio.connect(url, language="es") as api:
     await api["books"].update("7", {"price": "19.00"}, if_match=book)
 ```
 
-La misma API, con `await` y `async for`. Necesita httpx (`pip install httpx`, o el extra
-`restep-py[async]`); sin él, `restep.aio.connect` da `ImportError` salvo que le pases `client=`,
-cualquier objeto con la forma de `httpx.AsyncClient` (`async request(method, url, headers=,
-content=)` que devuelve algo con `status_code`, `headers` y `content`).
+The same API, with `await` and `async for`. It needs httpx (`pip install httpx`, or the
+`restep-py[async]` extra); without it, `restep.aio.connect` raises `ImportError` unless you pass
+`client=`, any object shaped like `httpx.AsyncClient` (`async request(method, url, headers=,
+content=)` returning something with `status_code`, `headers` and `content`).
 
-## Pruebas
+## Tests
 
 ```bash
-python3 tools/restep-py/test.py      # desde restep/
+python3 tools/restep-py/test.py      # from restep/
 ```
 
-Arranca el servidor de referencia en el puerto 8890 y, con `RESTEP_TOKEN`, en el 8891, y dos
-servidores de pega en Python en el 8892 y el 8893 para lo que el de referencia no tiene o no
-provoca (acciones con `on` o `method` desconocidos, fallos `429`/`503`, `Deprecation`,
-`service-desc` y un servidor solo core). Contra la referencia se prueban la subcolección
-`reviews` con su padre (`404` si el libro no existe, borrada con él), `include` con profundidad 2,
-la relación `highlight` con `href`, la polimórfica `showcase` con `type`, y las acciones
-`low_stock` (`GET` de colección), `restock` (`POST` de elemento con `input`) y
-`find_or_create` e `inherit_tax` (idempotentes). Las comprobaciones de validación local piden lo mismo con `validate=True` y con
-`validate=False` y exigen la misma clase de error y el mismo `parameter` del cliente y del
-servidor. La parte asíncrona se prueba con un cliente de pega con la forma de httpx; si httpx
-está instalado, también con él.
+It starts the reference server on port 8890 and, with `RESTEP_TOKEN`, on 8891, plus two fake
+Python servers on 8892 and 8893 for what the reference server lacks or cannot trigger (actions
+with an unknown `on` or `method`, `429`/`503` failures, `Deprecation`, `service-desc` and a
+core-only server). Against the reference server it tests the `reviews` subcollection with its
+parent (`404` if the book does not exist, deleted along with it), `include` with depth 2, the
+`highlight` relation with `href`, the polymorphic `showcase` with `type`, and the actions
+`low_stock` (collection `GET`), `restock` (item `POST` with `input`) and `find_or_create` and
+`inherit_tax` (idempotent). The local validation checks send the same request with
+`validate=True` and with `validate=False` and require the same error class and the same
+`parameter` from client and server. The async part is tested with a fake httpx-shaped client;
+if httpx is installed, with httpx too.
 
-## Borrador 6: lo que el cliente cumple (§12.2)
+## Draft 6: what the client complies with (§12.2)
 
-- **Versión** (§1.1): valida `restep` con su gramática y rechaza otra versión mayor; `api.version`
-  y `api.pre_release` dicen si es un borrador o un candidato. El cliente no hace nada distinto
-  con un borrador: solo lo expone, para que quien lo use no le suponga garantías.
-- **Partes experimentales** (§1.2): `restep.IMPLEMENTED_VERSIONS` es solo `1.0-draft.6`: el texto de la `1.0` aún no existe.
-  `api.usable("inherit")` es falso si el servidor declara otra versión, y entonces
-  `Collection.inherited` da `restep.ExperimentalNotUsable`. `sync`, `batch`, `filter-expr` y
-  `query-method` no los usa nunca (no los implementa).
-- **Miembros y valores desconocidos** (§3, §4.2): se ignoran; los valores desconocidos de `type`,
-  `on`, `method`, `kind`, `count`, `id_from` y `collations` siguen las reglas de arriba.
-- **Tipos de medio y `+`** (§3, §5.2): `application/json` en todo cuerpo (merge patch en
-  `PATCH`); la query se codifica con `quote`, así que un `+` literal sale `%2B` (desfases
-  horarios, cursores); `next` se sigue tal cual.
-- **Enlaces y credenciales** (§3, §4.3): no sigue enlaces con un esquema que no sea `https` ni el
-  de la raíz; el token y las cabeceras de `headers` solo van al origen de la API; las
-  redirecciones no se siguen.
-- **`id_from`, subcolecciones y singletons** (§5.1, §4.2, §5.9): arriba. Un singleton con
-  plantilla en `path` o con `parent` se ignora.
-- **Errores** (§5.4): un `code` desconocido, por la clase de su estado; un `reason` desconocido no
-  cambia nada: la excepción es la de su `code` y el `reason` queda en `e.reason`.
-- **`inherit`** (§11.6): un `from` desconocido en `_inherited` es `"hidden"`.
+- **Version** (§1.1): validates `restep` against its grammar and rejects any other major version;
+  `api.version` and `api.pre_release` say whether it is a draft or a candidate. The client does
+  nothing differently with a draft: it only exposes it, so whoever uses it does not assume
+  guarantees.
+- **Experimental parts** (§1.2): `restep.IMPLEMENTED_VERSIONS` is only `1.0-draft.6`: the text of
+  `1.0` does not exist yet. `api.usable("inherit")` is false if the server declares another
+  version, and then `Collection.inherited` raises `restep.ExperimentalNotUsable`. It never uses
+  `sync`, `batch`, `filter-expr` or `query-method` (it does not implement them).
+- **Unknown members and values** (§3, §4.2): ignored; unknown values of `type`, `on`, `method`,
+  `kind`, `count`, `id_from` and `collations` follow the rules above.
+- **Media types and `+`** (§3, §5.2): `application/json` on every body (merge patch on `PATCH`);
+  the query is encoded with `quote`, so a literal `+` goes out as `%2B` (time-zone offsets,
+  cursors); `next` is followed as is.
+- **Links and credentials** (§3, §4.3): it does not follow links with a scheme other than `https`
+  or the root's; the token and the `headers` only go to the API's origin; redirects are not
+  followed.
+- **`id_from`, subcollections and singletons** (§5.1, §4.2, §5.9): above. A singleton with a
+  template in `path` or with `parent` is ignored.
+- **Errors** (§5.4): an unknown `code` goes by its status's class; an unknown `reason` changes
+  nothing: the exception is the one for its `code` and the `reason` stays in `e.reason`.
+- **`inherit`** (§11.6): an unknown `from` in `_inherited` is `"hidden"`.
 
-## Limitaciones
+## Limitations
 
-- No valida los cuerpos contra los esquemas `create`/`update` (haría falta un validador de
-  JSON Schema); de eso se encarga el servidor con su `422 invalid`. Tampoco descarga esquemas
-  enlazados: la comprobación de `fields` solo usa un esquema `item` incrustado.
-- No implementa `sync` (`:changes`, eventos), `batch`, `filter-expr` ni `query-method`, ni
-  `Prefer: return=minimal`, ni las relaciones de un singleton más allá de leerlas.
-- No vuelve a pedir el descubrimiento tras un `unsupported_parameter` o un `405` para algo que su
-  copia declara (§4.2, un DEBERÍA), ni lo revalida con su `Cache-Control`: lo lee una vez al
-  conectar. Tampoco hace nada con el perfil `cache` (§8) más allá de copiar la `ETag` en `_etag`.
-- No comprueba que una colección declarada sea coherente (variables distintas, `parent` que
-  existe): eso es cosa del servidor y de `restep-check`.
-- Con `idempotency.anonymous: false`, solo sabe si lleva credenciales por `token` y por
-  `Authorization` o `Cookie` en `headers`; un certificado de cliente no lo ve.
-- La rama de httpx real no se ha probado aquí (httpx no está instalado en esta máquina); la
-  lógica asíncrona sí, con el cliente de pega.
-- Los tipos son `dict[str, Any]`: el cliente es dinámico. Para tipos por colección está
+- It does not validate bodies against the `create`/`update` schemas (that would need a JSON
+  Schema validator); the server handles that with its `422 invalid`. Nor does it download linked
+  schemas: the `fields` check only uses an embedded `item` schema.
+- It does not implement `sync` (`:changes`, events), `batch`, `filter-expr` or `query-method`, nor
+  `Prefer: return=minimal`, nor a singleton's relations beyond reading them.
+- It does not fetch the discovery document again after an `unsupported_parameter` or a `405` for
+  something its copy declares (§4.2, a SHOULD), nor revalidate it with its `Cache-Control`: it
+  reads it once on connect. Nor does it do anything with the `cache` profile (§8) beyond copying
+  the `ETag` into `_etag`.
+- It does not check that a declared collection is consistent (distinct variables, a `parent` that
+  exists): that is up to the server and `restep-check`.
+- With `idempotency.anonymous: false`, it only knows it has credentials through `token` and
+  `Authorization` or `Cookie` in `headers`; it cannot see a client certificate.
+- The real httpx branch has not been tested here (httpx is not installed on this machine); the
+  async logic has, with the fake client.
+- Types are `dict[str, Any]`: the client is dynamic. For per-collection types there is
   `restep-ts` (TypeScript).
 
-## Dudas sobre la spec
+## Questions about the spec
 
-Las dudas del borrador 5 (si `429` y `503` garantizan que no hubo efecto, qué da una acción no
-declarada, si `fields=id` vale, si un `PATCH` repetido es seguro, cuánto guardar el
-descubrimiento) las resuelve el borrador 6 en §5.7, §11.1, §6.3 y §4.2. Quedan:
+The questions from draft 5 (whether `429` and `503` guarantee there was no effect, what an
+undeclared action returns, whether `fields=id` is valid, whether a repeated `PATCH` is safe, how
+long to keep the discovery document) are settled by draft 6 in §5.7, §11.1, §6.3 and §4.2.
+Still open:
 
-- **`include` anidado en una relación a varias colecciones** (`to` como lista): §9 no dice cómo
-  se valida `include=a.b` cuando `a` puede apuntar a colecciones con relaciones distintas. El
-  cliente lo rechaza en local.
-- **Qué es «usar» `inherit`.** §1.2 dice que usar una parte experimental es mandar una petición
-  que solo ella define o apoyarse en una de sus reglas para leer una respuesta. Escribir el campo
-  propio es un `PATCH` corriente, así que el cliente solo lo restringe en `inherited()`, que lee
-  `_inherited`. Leer el campo efectivo como un campo más tampoco sería usarlo.
-- **`"1.0"` como versión implementada.** §1.2 pide implementar «el texto de la versión que
-  declara»; el cliente da por hecho que la 1.0 publicada tendrá el texto del borrador 6 en sus
-  partes experimentales, cosa que solo se sabrá al publicarla.
+- **Nested `include` on a relation to several collections** (`to` as a list): §9 does not say how
+  `include=a.b` is validated when `a` can point to collections with different relations. The
+  client rejects it locally.
+- **What "using" `inherit` means.** §1.2 says using an experimental part means sending a request
+  only that part defines, or relying on one of its rules to read a response. Writing the own
+  field is an ordinary `PATCH`, so the client only restricts it in `inherited()`, which reads
+  `_inherited`. Reading the effective field like any other field would not be using it either.
+- **`"1.0"` as an implemented version.** §1.2 asks for implementing "the text of the version it
+  declares"; the client assumes the published 1.0 will have draft 6's text in its experimental
+  parts, which will only be known once it is published.
 
-## Código y avisos
+## Code and issues
 
-Código y avisos: <https://github.com/restep-spec/restep-py>. Ese repositorio se genera desde la web de
-Restep, donde la herramienta se desarrolla junto a la [especificación](https://restep.wubytes.com/1/) y el servidor de
-referencia: `vendor/` y `schema/` son copias de la web para que las pruebas funcionen solas.
+Code and issues: <https://github.com/restep-spec/restep-py>. That repository is generated from the Restep
+site, where the tool is developed alongside the [specification](https://restep.wubytes.com/1/) and the reference
+server: `vendor/` and `schema/` are copies from the site so the tests run on their own.
 
-Licencia MIT.
+MIT licensed.
