@@ -1,13 +1,13 @@
-"""Excepciones tipadas a partir de los errores problem+json de Restep (§5.4).
+"""Typed exceptions built from Restep's problem+json errors (§5.4).
 
-Cada ``code`` de la tabla de §5.4 tiene su clase. Un ``code`` desconocido se trata según la
-clase del estado (§5.4: «El cliente DEBE tratar un code que no conoce según la clase del
-status»): la clase por defecto de ese estado si no es ambigua, si no ``ClientError`` o
+Each ``code`` in the table of §5.4 has its class. An unknown ``code`` is handled by the
+class of its status (§5.4: "The client MUST treat a code it does not know by the class of the
+status"): the default class for that status if it is not ambiguous, otherwise ``ClientError`` or
 ``ServerError``.
 
-Los errores que el cliente detecta antes de enviar la petición (validación local contra el
-descubrimiento) son de las mismas clases, con ``local = True``, para que el código que los
-captura no tenga que distinguir quién los ha detectado.
+Errors the client detects before sending the request (local validation against the
+discovery document) are of the same classes, with ``local = True``, so that the code that
+catches them does not have to tell who detected them.
 """
 from __future__ import annotations
 
@@ -17,18 +17,19 @@ from typing import Any, Mapping
 __all__ = [
     "RestepError", "ClientError", "ServerError",
     "BadRequest", "InvalidParameter", "UnsupportedParameter", "IdempotencyKeyRequired",
-    "Unauthenticated", "Forbidden", "NotFound", "MethodNotAllowed", "NotAcceptable", "Conflict",
+    "Unauthenticated", "Forbidden", "NotFound", "MethodNotAllowed", "NotAcceptable", "RequestTimeout", "Conflict",
     "RequestInProgress", "Gone", "StateExpired", "Retired", "PreconditionFailed", "ContentTooLarge", "UriTooLong",
-    "UnsupportedMediaType", "Invalid", "IdempotencyMismatch", "NotExecuted", "PreconditionRequired",
-    "RateLimited", "Internal", "ServerNotImplemented", "Unavailable",
+    "UnsupportedMediaType", "MisdirectedRequest", "Invalid", "IdempotencyMismatch", "NotExecuted", "TooEarly",
+    "PreconditionRequired", "RateLimited", "Internal", "ServerNotImplemented", "BadGateway", "Unavailable", "GatewayTimeout",
+    "CODES", "code_for_status",
     "RestepDeprecationWarning", "UnsupportedVersion", "ExperimentalNotUsable", "error_from_problem",
 ]
 
 
 class RestepError(Exception):
-    """Un error de una API Restep. ``problem`` es el objeto problem+json entero."""
+    """An error from a Restep API. ``problem`` is the whole problem+json object."""
 
-    code: str | None = None  # el code que representa la clase; la instancia lleva el que llegó
+    code: str | None = None  # the code the class stands for; the instance carries the one that arrived
 
     def __init__(self, status: int, problem: Mapping[str, Any], *, headers: Mapping[str, str] | None = None,
                  local: bool = False, url: str | None = None, method: str | None = None) -> None:
@@ -52,24 +53,31 @@ class RestepError(Exception):
     def _message(self) -> str:
         text = self.detail or self.title or f"HTTP {self.status}"
         where = f" ({self.parameter})" if self.parameter else ""
-        origin = " [detectado en el cliente]" if self.local else ""
+        origin = " [detected in the client]" if self.local else ""
         return f"{self.status} {self.code or ''}{where}: {text}{origin}".replace("  ", " ")
 
     @property
     def retry_after(self) -> float | None:
-        """Segundos que pide esperar ``Retry-After``, si llegó (en segundos o como fecha HTTP)."""
+        """Seconds that ``Retry-After`` asks to wait, if it arrived (in seconds or as an HTTP date)."""
         return parse_retry_after(self.headers.get("retry-after"))
+
+    @property
+    def accept_post(self) -> list[str] | None:
+        """The media types of ``Accept-Post``, if it arrived: on a ``415`` to a ``POST``, what the
+        collection accepts (§5.1)."""
+        value = self.headers.get("accept-post")
+        return None if value is None else [t.strip() for t in value.split(",") if t.strip()]
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(status={self.status}, code={self.code!r}, parameter={self.parameter!r}, detail={self.detail!r})"
 
 
 class ClientError(RestepError):
-    """Un 4xx: hay que cambiar la petición."""
+    """A 4xx: the request has to change."""
 
 
 class ServerError(RestepError):
-    """Un 5xx: el fallo es del servidor."""
+    """A 5xx: the failure is the server's."""
 
 
 # ── 4xx ───────────────────────────────────────────────────────────────────────
@@ -78,12 +86,12 @@ class BadRequest(ClientError):
 
 
 class InvalidParameter(BadRequest):
-    """Un parámetro admitido con un valor erróneo: corrige el valor y reintenta (§5.3)."""
+    """A supported parameter with a wrong value: fix the value and retry (§5.3)."""
     code = "invalid_parameter"
 
 
 class UnsupportedParameter(BadRequest):
-    """El recurso no ofrece lo que pide el parámetro: no reintentes, renuncia a la capacidad (§5.3)."""
+    """The resource does not offer what the parameter asks for: do not retry, give up the capability (§5.3)."""
     code = "unsupported_parameter"
 
 
@@ -100,7 +108,7 @@ class Unauthenticated(ClientError):
 
     @property
     def resource_metadata(self) -> str | None:
-        """La URL de los metadatos de recurso protegido del reto, si la trae (§11.5, RFC 9728)."""
+        """The URL of the protected resource metadata from the challenge, if it carries one (§11.5, RFC 9728)."""
         m = re.search(r'resource_metadata="([^"]*)"', self.www_authenticate or "")
         return m.group(1) if m else None
 
@@ -125,19 +133,24 @@ class NotAcceptable(ClientError):
     code = "not_acceptable"
 
 
+class RequestTimeout(ClientError):
+    """408: the server did not get the whole request in time; it can be repeated as is (§5.7)."""
+    code = "request_timeout"
+
+
 class Conflict(ClientError):
-    """Choca con el estado actual: un duplicado, una transición imposible. Repetirla no sirve."""
+    """Clashes with the current state: a duplicate, an impossible transition. Repeating it is no use."""
     code = "conflict"
 
 
 class RequestInProgress(ClientError):
-    """La misma petición con la misma ``Idempotency-Key`` sigue en curso (§7.1): se puede volver a
-    enviar con la misma clave, después de ``retry_after`` si llegó. No es un ``Conflict``."""
+    """The same request with the same ``Idempotency-Key`` is still running (§7.1): it can be sent
+    again with the same key, after ``retry_after`` if it arrived. It is not a ``Conflict``."""
     code = "request_in_progress"
 
 
 class Gone(ClientError):
-    """Un 410: base de ``StateExpired`` y ``Retired``."""
+    """A 410: the base of ``StateExpired`` and ``Retired``."""
 
 
 class StateExpired(Gone):
@@ -149,7 +162,7 @@ class Retired(Gone):
 
 
 class PreconditionFailed(ClientError):
-    """``If-Match`` no coincide: alguien cambió el elemento; vuelve a leerlo (§7.2)."""
+    """``If-Match`` does not match: someone changed the item; read it again (§7.2)."""
     code = "precondition_failed"
 
 
@@ -165,8 +178,14 @@ class UnsupportedMediaType(ClientError):
     code = "unsupported_media_type"
 
 
+class MisdirectedRequest(ClientError):
+    """421: the request reached a server that cannot answer for this origin; it can be repeated over
+    another connection (§5.7)."""
+    code = "misdirected_request"
+
+
 class Invalid(ClientError):
-    """El cuerpo se entiende pero no es válido; el detalle va en ``errors`` (§5.4)."""
+    """The body is understood but not valid; the detail is in ``errors`` (§5.4)."""
     code = "invalid"
 
 
@@ -176,6 +195,12 @@ class IdempotencyMismatch(ClientError):
 
 class NotExecuted(ClientError):
     code = "not_executed"
+
+
+class TooEarly(ClientError):
+    """425: the server will not process a request sent in TLS early data; it can be repeated without
+    it (§5.7, RFC 8470). This client never sends early data."""
+    code = "too_early"
 
 
 class PreconditionRequired(ClientError):
@@ -195,57 +220,82 @@ class ServerNotImplemented(ServerError):
     code = "not_implemented"
 
 
+class BadGateway(ServerError):
+    """502: a server the API depends on answered wrongly; it says nothing about the effect (§5.7)."""
+    code = "bad_gateway"
+
+
 class Unavailable(ServerError):
     code = "unavailable"
 
 
+class GatewayTimeout(ServerError):
+    """504: a server the API depends on did not answer in time; it says nothing about the effect (§5.7)."""
+    code = "gateway_timeout"
+
+
 class RestepDeprecationWarning(DeprecationWarning):
-    """La respuesta llevaba ``Deprecation`` (§5.5): lo que se ha usado se va a retirar."""
+    """The response carried ``Deprecation`` (§5.5): what was used is going to be retired."""
 
 
 class UnsupportedVersion(ValueError):
-    """El documento de descubrimiento declara en ``restep`` algo que no es una versión de Restep 1:
-    no sigue la gramática de §1.1 o su versión mayor no es 1. Un cliente de Restep 1 no lo trata
-    como descubrimiento ni supone por eso solo ``core`` (§1.1): esa API no es Restep 1."""
+    """The discovery document declares in ``restep`` something that is not a Restep 1 version:
+    it does not follow the grammar of §1.1 or its major version is not 1. A Restep 1 client does not
+    treat it as discovery nor assume ``core`` only because of it (§1.1): that API is not Restep 1."""
 
     def __init__(self, version: Any, url: str | None = None) -> None:
         self.version = version
         self.url = url
-        where = f" en {url}" if url else ""
-        super().__init__(f"El descubrimiento{where} declara restep={version!r}, que no es una versión de Restep 1 (§1.1).")
+        where = f" at {url}" if url else ""
+        super().__init__(f"The discovery document{where} declares restep={version!r}, which is not a Restep 1 version (§1.1).")
 
 
 class ExperimentalNotUsable(LookupError):
-    """Una parte experimental (§1.2) que el servidor no anuncia, o que anuncia bajo una versión cuyo
-    texto este cliente no implementa: no se usa (§1.2)."""
+    """An experimental part (§1.2) that the server does not announce, or announces under a version whose
+    text this client does not implement: it is not used (§1.2)."""
 
 
 _BY_CODE: dict[str, type[RestepError]] = {
     cls.code: cls for cls in (
         BadRequest, InvalidParameter, UnsupportedParameter, IdempotencyKeyRequired, Unauthenticated, Forbidden,
-        NotFound, MethodNotAllowed, NotAcceptable, Conflict, RequestInProgress, StateExpired, Retired, PreconditionFailed,
-        ContentTooLarge, UriTooLong, UnsupportedMediaType, Invalid, IdempotencyMismatch, NotExecuted,
-        PreconditionRequired, RateLimited, Internal, ServerNotImplemented, Unavailable)
+        NotFound, MethodNotAllowed, NotAcceptable, RequestTimeout, Conflict, RequestInProgress, StateExpired, Retired,
+        PreconditionFailed, ContentTooLarge, UriTooLong, UnsupportedMediaType, MisdirectedRequest, Invalid,
+        IdempotencyMismatch, NotExecuted, TooEarly, PreconditionRequired, RateLimited, Internal, ServerNotImplemented,
+        BadGateway, Unavailable, GatewayTimeout)
     if cls.code
 }
 
-# Para un code desconocido: la clase del estado cuando solo hay una candidata.
+# For an unknown code: the status's class when there is only one candidate.
 _BY_STATUS: dict[int, type[RestepError]] = {
     400: BadRequest, 401: Unauthenticated, 403: Forbidden, 404: NotFound, 405: MethodNotAllowed,
-    406: NotAcceptable, 409: Conflict, 410: Gone, 412: PreconditionFailed, 413: ContentTooLarge,
-    414: UriTooLong, 415: UnsupportedMediaType, 424: NotExecuted, 428: PreconditionRequired,
-    429: RateLimited, 500: Internal, 501: ServerNotImplemented, 503: Unavailable,
+    406: NotAcceptable, 408: RequestTimeout, 409: Conflict, 410: Gone, 412: PreconditionFailed, 413: ContentTooLarge,
+    414: UriTooLong, 415: UnsupportedMediaType, 421: MisdirectedRequest, 424: NotExecuted, 425: TooEarly,
+    428: PreconditionRequired, 429: RateLimited, 500: Internal, 501: ServerNotImplemented, 502: BadGateway,
+    503: Unavailable, 504: GatewayTimeout,
 }
 
-# Estados que la tabla de §5.4 asocia a cada code: si llegan juntos de forma incoherente, manda el estado.
-_STATUS_OF: dict[str, int] = {
+# The closed table of §5.4 (and of problem.json): each code with its status. A status the table does
+# not list has the code http_ and its three digits (http_418).
+CODES: dict[str, int] = {
     "bad_request": 400, "invalid_parameter": 400, "unsupported_parameter": 400, "idempotency_key_required": 400,
     "unauthenticated": 401, "forbidden": 403, "not_found": 404, "method_not_allowed": 405, "not_acceptable": 406,
-    "conflict": 409, "request_in_progress": 409, "state_expired": 410, "retired": 410, "precondition_failed": 412, "content_too_large": 413,
-    "uri_too_long": 414, "unsupported_media_type": 415, "invalid": 422, "idempotency_mismatch": 422,
-    "not_executed": 424, "precondition_required": 428, "rate_limited": 429, "internal": 500,
-    "not_implemented": 501, "unavailable": 503,
+    "request_timeout": 408, "conflict": 409, "request_in_progress": 409, "state_expired": 410, "retired": 410,
+    "precondition_failed": 412, "content_too_large": 413, "uri_too_long": 414, "unsupported_media_type": 415,
+    "misdirected_request": 421, "invalid": 422, "idempotency_mismatch": 422, "not_executed": 424, "too_early": 425,
+    "precondition_required": 428, "rate_limited": 429, "internal": 500, "not_implemented": 501, "bad_gateway": 502,
+    "unavailable": 503, "gateway_timeout": 504,
 }
+_STATUS_OF = CODES
+_TABLE_STATUSES = frozenset(CODES.values())
+
+
+def code_for_status(status: int) -> str | None:
+    """The code a status gets when the table of §5.4 gives it only one, ``http_`` and its digits when
+    the table does not list it, or ``None`` when the table gives it several (400, 409, 410, 422)."""
+    if status not in _TABLE_STATUSES:
+        return f"http_{status}"
+    codes = [c for c, s in CODES.items() if s == status]
+    return codes[0] if len(codes) == 1 else None
 
 
 def error_class(status: int, code: str | None) -> type[RestepError]:
@@ -257,14 +307,14 @@ def error_class(status: int, code: str | None) -> type[RestepError]:
 
 
 def error_from_problem(status: int, problem: Mapping[str, Any], **kwargs: Any) -> RestepError:
-    """La excepción que corresponde a un problem+json con ese estado."""
+    """The exception that corresponds to a problem+json with that status."""
     return error_class(status, _str(problem.get("code")))(status, problem, **kwargs)
 
 
 def local_error(cls: type[RestepError], detail: str, *, parameter: str | None = None,
                 status: int = 400, **extra: Any) -> RestepError:
-    """Un error detectado en el cliente, con la misma forma que el que daría el servidor."""
-    code = cls.code or "bad_request"
+    """An error detected in the client, with the same shape the server would give."""
+    code = cls.code or code_for_status(status) or "bad_request"
     problem: dict[str, Any] = {"type": f"https://w3id.org/restep/1/errors#{code}", "title": detail,
                                "status": status, "code": code, "detail": detail, **extra}
     if parameter is not None:
